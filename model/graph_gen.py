@@ -294,7 +294,7 @@ class GraphGenerator(nn.Module):
                     cb = int(const_logits.argmax().item())
                 else:
                     cb = int(torch.distributions.Categorical(logits=const_logits).sample().item())
-                v = self.const_vocab.decode(cb)
+                v = self.const_vocab.decode(cb, ty=ret_ty)
                 # OOV → fall back to 0; not a great guess but keeps generation going.
                 const_value = v if v is not None else 0
 
@@ -305,7 +305,8 @@ class GraphGenerator(nn.Module):
 
             operand_embeds = [candidate_embeds[p] for p in operand_ptrs]
             cb_for_seed = (
-                self.const_vocab.encode(const_value) if op is NodeOp.CONST else None
+                self.const_vocab.encode(const_value, ty=ret_ty)
+                if op is NodeOp.CONST else None
             )
             new_emb = self._node_candidate(op_id, ret_ty, operand_embeds, cb_for_seed, device)
             new_idx = len(candidate_embeds)

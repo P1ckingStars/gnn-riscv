@@ -16,7 +16,7 @@ from enum import Enum
 from typing import Iterable
 
 from model.graph import NodeOp
-from spec.dsl import BinOp, CmpOp, Ty, UnOp, mask_to
+from spec.dsl import BinOp, CmpOp, Ty, UnOp, mask_to, signed
 
 
 # ---- Const bucket vocab ------------------------------------------------------
@@ -46,19 +46,33 @@ class ConstVocab:
         self._idx_to_val: tuple[int | None, ...] = (None, *_CANON_VALUES)
         self.size = len(self._idx_to_val)
 
-    def encode(self, value: int) -> int:
+    def encode(self, value: int, ty: Ty | None = None) -> int:
+        """Lookup the bucket for ``value``. If ``ty`` is given, also try the signed
+        reinterpretation — so e.g. ``0xFFFFFFFF`` with ``ty=I32`` maps to the ``-1``
+        bucket. Generator outputs are unsigned-canonical, so this re-check matters."""
         idx = self._val_to_idx.get(value)
         if idx is not None:
             return idx
-        # Try the signed-equivalent representation if value looks like a wrapped negative.
-        # No — keep bucket lookup strict; we don't know the source ty here.
+        if ty is not None:
+            s = signed(value, ty)
+            if s != value:
+                idx = self._val_to_idx.get(s)
+                if idx is not None:
+                    return idx
         return self.OOV_INDEX
 
-    def decode(self, idx: int) -> int | None:
-        """Returns ``None`` for the OOV bucket; caller picks a default."""
-        if 0 <= idx < self.size:
-            return self._idx_to_val[idx]
-        raise IndexError(f"const bucket idx {idx} out of range [0, {self.size})")
+    def decode(self, idx: int, ty: Ty | None = None) -> int | None:
+        """Returns ``None`` for OOV. If ``ty`` is given, the decoded value is returned
+        in unsigned-canonical form for that type — so model outputs slot directly into a
+        ``Const`` node without further conversion at the call site."""
+        if not (0 <= idx < self.size):
+            raise IndexError(f"const bucket idx {idx} out of range [0, {self.size})")
+        v = self._idx_to_val[idx]
+        if v is None:
+            return None
+        if ty is not None:
+            return mask_to(v, ty)
+        return v
 
 
 # ---- Op vocab (decoder side) -------------------------------------------------
@@ -166,8 +180,8 @@ class SpecVocab:
         if not (0 <= idx < MAX_VARS):
             raise IndexError(f"var idx {idx} out of range")
         return self._off_vars + idx
-    def const(self, value: int) -> int:
-        return self._off_consts + self.consts.encode(value)
+    def const(self, value: int, ty: Ty | None = None) -> int:
+        return self._off_consts + self.consts.encode(value, ty=ty)
 
 
 # ---- Spec → token-id sequence -------------------------------------------------
@@ -231,7 +245,7 @@ def _emit_expr(e, ids: list[int], sv: SpecVocab, var_idx) -> None:
     if isinstance(e, Const):
         ids.append(sv.tok(SpecTok.NODE_CONST))
         ids.append(sv.ty(e.ty))
-        ids.append(sv.const(e.value))
+        ids.append(sv.const(e.value, ty=e.ty))
         return
     if isinstance(e, Var):
         ids.append(sv.tok(SpecTok.NODE_VAR))

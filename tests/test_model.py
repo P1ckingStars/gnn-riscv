@@ -86,12 +86,53 @@ def test_spec_tokenize_uses_positional_var_slots():
 
 def test_dataset_builds_small_set():
     sv = SpecVocab(); ov = OpVocab()
-    ds = SpecDataset(n_specs=4, seed=42, max_depth=2, n_params=2, sv=sv, ov=ov)
+    ds = SpecDataset.synthetic(n_specs=4, seed=42, max_depth=2, n_params=2, sv=sv, ov=ov)
     assert len(ds) == 4
     s = ds[0]
     assert s.spec_tokens, "non-empty token list"
     assert len(s.op_ids) == len(s.operand_lists) == len(s.const_bucket_ids)
     assert s.op_ids[-1] == ov.encode(NodeOp.RETURN)
+
+
+def test_dataset_from_directory(tmp_path):
+    """Build a tiny disk dataset via the public script's API, then load it back."""
+    import subprocess, sys
+    out = tmp_path / "ds"
+    subprocess.run(
+        [sys.executable, "scripts/build_dataset.py",
+         "--n", "6", "--out", str(out), "--seed", "0",
+         "--max-depth", "2", "--n-params", "2",
+         "--n-inputs", "8", "--no-baselines"],
+        check=True, capture_output=True,
+    )
+    sv = SpecVocab(); ov = OpVocab()
+    ds = SpecDataset.from_directory(out, sv=sv, ov=ov)
+    assert len(ds) >= 1   # some specs may be filtered for SEXT/ZEXT/TRUNC
+    for s in ds.samples:
+        assert s.op_ids[-1] == ov.encode(NodeOp.RETURN)
+
+
+def test_random_split_partition_and_determinism():
+    from model.data import random_split
+    sv = SpecVocab(); ov = OpVocab()
+    ds = SpecDataset.synthetic(n_specs=10, seed=0, max_depth=2, n_params=2, sv=sv, ov=ov)
+    a, b = random_split(ds, val_frac=0.2, seed=7)
+    a2, b2 = random_split(ds, val_frac=0.2, seed=7)
+    assert len(a) + len(b) == len(ds)
+    assert len(b) == 2
+    # Determinism: same seed → same split.
+    assert [s.spec_tokens for s in b.samples] == [s.spec_tokens for s in b2.samples]
+
+
+def test_const_vocab_encodes_wrapped_negative():
+    """Generator emits negatives in unsigned-canonical form; vocab must round-trip
+    them via the ty hint, not put them in OOV."""
+    cv = ConstVocab()
+    from spec.dsl import Ty, mask_to
+    wrapped = mask_to(-1, Ty.I32)  # 0xFFFFFFFF
+    idx = cv.encode(wrapped, ty=Ty.I32)
+    assert idx != cv.OOV_INDEX, "wrapped -1 should not be OOV when ty given"
+    assert cv.decode(idx, ty=Ty.I32) == wrapped
 
 
 # ---- Model forward + generate ----------------------------------------------
@@ -107,7 +148,7 @@ def test_encoder_forward_shapes():
 
 def test_generator_teacher_forced_loss_is_finite():
     sv = SpecVocab(); ov = OpVocab()
-    ds = SpecDataset(n_specs=2, seed=7, max_depth=2, n_params=2, sv=sv, ov=ov)
+    ds = SpecDataset.synthetic(n_specs=2, seed=7, max_depth=2, n_params=2, sv=sv, ov=ov)
     enc = SpecEncoder(vocab_size=sv.size, d_model=64, n_layers=1, n_heads=4)
     gen = GraphGenerator(op_vocab=ov, const_vocab=sv.consts, d_model=64, gnn_heads=4)
     sample = ds[0]
@@ -135,7 +176,7 @@ def test_generator_generate_terminates_on_random_init():
 def test_overfit_one_sample_decreases_loss():
     """Sanity: 50 steps on a single sample should monotonically decrease loss."""
     sv = SpecVocab(); ov = OpVocab()
-    ds = SpecDataset(n_specs=1, seed=11, max_depth=2, n_params=2, sv=sv, ov=ov)
+    ds = SpecDataset.synthetic(n_specs=1, seed=11, max_depth=2, n_params=2, sv=sv, ov=ov)
     enc = SpecEncoder(vocab_size=sv.size, d_model=64, n_layers=1, n_heads=4)
     gen = GraphGenerator(op_vocab=ov, const_vocab=sv.consts, d_model=64, gnn_heads=4)
     opt = torch.optim.AdamW(list(enc.parameters()) + list(gen.parameters()), lr=5e-3)
