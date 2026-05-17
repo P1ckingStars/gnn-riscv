@@ -51,8 +51,14 @@ class LCSample:
 
 def load_corpus(
     data_dir: Path, kv: CursorKindVocab, tv: TypeClassVocab, vv: ValueBucketVocab,
-    av: AsmVocab, limit: int | None = None,
+    av: AsmVocab, limit: int | None = None, int_only: bool = False,
 ) -> list[LCSample]:
+    """Load (source.c, ref_o2.s, signature.json) triples from a dataset directory.
+
+    ``int_only`` filters to diff-testable signatures (needed for val_pass eval). When
+    False, accepts any sample whose asm tokenizes — appropriate for pretraining
+    on AnghaBench-style real C where most signatures touch pointers/structs.
+    """
     samples: list[LCSample] = []
     n_skipped = 0
     skip_reasons: dict[str, int] = {}
@@ -60,9 +66,16 @@ def load_corpus(
     def bump(r: str) -> None:
         skip_reasons[r] = skip_reasons.get(r, 0) + 1
 
+    candidates = []
     for d in sorted(data_dir.iterdir()):
-        if not d.is_dir() or not d.name.startswith(("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")):
+        if not d.is_dir():
             continue
+        # AnghaBench dirs start with 'ang_'; LeetCode dirs start with a digit.
+        if not (d.name[0].isdigit() or d.name.startswith("ang_")):
+            continue
+        candidates.append(d)
+
+    for d in candidates:
         if limit is not None and len(samples) >= limit:
             break
         try:
@@ -71,9 +84,10 @@ def load_corpus(
             asm = (d / "ref_o2.s").read_text()
         except FileNotFoundError:
             n_skipped += 1; bump("missing_file"); continue
-        # v1 restriction: int-only signatures so differential testing works.
-        if not signature_is_int_only(sig):
-            n_skipped += 1; bump("non_int_signature"); continue
+        if int_only:
+            ok = sig.get("diff_testable", signature_is_int_only(sig))
+            if not ok:
+                n_skipped += 1; bump("non_int_signature"); continue
         try:
             g = parse_c_function(src, sig["fn_name"], kv, tv, vv)
         except Exception as e:
@@ -89,7 +103,7 @@ def load_corpus(
             problem_id=d.name, pyg_data=pyg, asm_ids=ids, signature=sig,
             ref_o2_asm=asm,
         ))
-    print(f"loaded {len(samples)} samples  (skipped {n_skipped})")
+    print(f"loaded {len(samples)} samples from {data_dir}  (skipped {n_skipped})")
     if skip_reasons:
         for r, n in sorted(skip_reasons.items(), key=lambda kv: -kv[1])[:5]:
             print(f"    {n:3d}  {r}")
@@ -148,23 +162,38 @@ def greedy_eval_one(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=Path, default=Path("data/leetcode"))
-    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--data", type=Path, default=Path("data/leetcode"),
+                    help="training corpus (single-source mode)")
+    ap.add_argument("--train-data", type=Path, default=None,
+                    help="training corpus; overrides --data when used with --eval-data")
+    ap.add_argument("--eval-data", type=Path, default=None,
+                    help="val_pass eval corpus (held-out from training). When set,"
+                         " --train-data is the training corpus and val_pass evals on"
+                         " --eval-data's diff-testable subset.")
+    ap.add_argument("--train-limit", type=int, default=None)
+    ap.add_argument("--eval-limit", type=int, default=None)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--n-layers", type=int, default=3)
     ap.add_argument("--n-heads", type=int, default=4)
-    ap.add_argument("--val-frac", type=float, default=0.1)
+    ap.add_argument("--val-frac", type=float, default=0.1,
+                    help="single-source mode only; ignored when --eval-data is set")
     ap.add_argument("--val-every", type=int, default=5,
                     help="run greedy + differential-test eval every K epochs (slow)")
     ap.add_argument("--val-n-inputs", type=int, default=32)
-    ap.add_argument("--device", type=str, default="cpu")
+    ap.add_argument("--val-max-samples", type=int, default=32,
+                    help="cap how many eval samples we run val_pass on per round")
+    ap.add_argument("--device", type=str, default="auto",
+                    help="'auto' uses cuda if available")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--exp-dir", type=Path, default=Path("experiments/leetcode_001"))
     args = ap.parse_args()
 
+    if args.device == "auto":
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(args.device)
+    print(f"device: {device}")
     torch.manual_seed(args.seed)
     import random
     random.seed(args.seed)
@@ -174,17 +203,33 @@ def main() -> None:
     print(f"vocabs — kind: {kv.size}  type: {tv.size}  value: {vv.size}  asm: {av.size}")
 
     t0 = time.time()
-    samples = load_corpus(args.data, kv, tv, vv, av, limit=args.limit)
-    print(f"loaded corpus in {time.time() - t0:.1f}s")
-
-    # Deterministic shuffle + split.
-    indices = list(range(len(samples)))
-    random.Random(args.seed).shuffle(indices)
-    n_val = max(1, int(round(len(samples) * args.val_frac)))
-    val_idx = set(indices[:n_val])
-    train_samples = [s for i, s in enumerate(samples) if i not in val_idx]
-    val_samples = [s for i, s in enumerate(samples) if i in val_idx]
-    print(f"split: train={len(train_samples)}  val={len(val_samples)}")
+    if args.eval_data is not None:
+        train_dir = args.train_data or args.data
+        train_samples = load_corpus(
+            train_dir, kv, tv, vv, av, limit=args.train_limit, int_only=False,
+        )
+        eval_pool = load_corpus(
+            args.eval_data, kv, tv, vv, av, limit=args.eval_limit, int_only=True,
+        )
+        # Split eval_pool into a val_loss subset (small) + val_pass subset (capped).
+        random.Random(args.seed).shuffle(eval_pool)
+        val_samples = eval_pool[: max(8, len(eval_pool) // 5)]
+        val_pass_samples = eval_pool[: args.val_max_samples]
+        print(f"split: train={len(train_samples)}  val_loss={len(val_samples)}  "
+              f"val_pass={len(val_pass_samples)}")
+    else:
+        samples = load_corpus(
+            args.data, kv, tv, vv, av, limit=args.train_limit, int_only=True,
+        )
+        indices = list(range(len(samples)))
+        random.Random(args.seed).shuffle(indices)
+        n_val = max(1, int(round(len(samples) * args.val_frac)))
+        val_idx = set(indices[:n_val])
+        train_samples = [s for i, s in enumerate(samples) if i not in val_idx]
+        val_samples = [s for i, s in enumerate(samples) if i in val_idx]
+        val_pass_samples = val_samples[: args.val_max_samples]
+        print(f"split: train={len(train_samples)}  val={len(val_samples)}")
+    print(f"loaded corpora in {time.time() - t0:.1f}s")
 
     encoder = CEncoder.build(
         kv, tv, vv, d_model=args.d_model, n_layers=args.n_layers, n_heads=args.n_heads,
@@ -204,7 +249,9 @@ def main() -> None:
     (args.exp_dir / "config.json").write_text(json.dumps({
         **{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "n_params": n_params,
-        "n_samples": len(samples),
+        "n_train": len(train_samples),
+        "n_val_loss": len(val_samples),
+        "n_val_pass": len(val_pass_samples),
     }, indent=2))
     log_path = args.exp_dir / "log.csv"
     with log_path.open("w", newline="") as fh:
@@ -242,13 +289,13 @@ def main() -> None:
         val_pass_str = ""
         if (epoch + 1) % args.val_every == 0 or epoch == args.epochs - 1:
             n_pass = 0
-            for s in val_samples:
+            for s in val_pass_samples:
                 ok, _why, _gen = greedy_eval_one(
                     encoder, decoder, s, av, device, args.val_n_inputs,
                 )
                 if ok:
                     n_pass += 1
-            val_pass_rate = n_pass / max(len(val_samples), 1)
+            val_pass_rate = n_pass / max(len(val_pass_samples), 1)
             val_pass_str = f"{val_pass_rate:.4f}"
             if val_pass_rate > best_val_pass:
                 best_val_pass = val_pass_rate

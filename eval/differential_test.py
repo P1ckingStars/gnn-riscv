@@ -24,7 +24,8 @@ from typing import Sequence
 _INT_TYPES = {
     "int", "unsigned int", "long", "unsigned long", "long long",
     "unsigned long long", "int32_t", "uint32_t", "int64_t", "uint64_t",
-    "bool",
+    "bool", "_Bool",
+    "short", "unsigned short", "char", "signed char", "unsigned char",
 }
 
 
