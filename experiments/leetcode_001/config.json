@@ -1,0 +1,17 @@
+{
+  "data": "data/leetcode",
+  "limit": null,
+  "epochs": 40,
+  "lr": 0.0003,
+  "d_model": 128,
+  "n_layers": 3,
+  "n_heads": 4,
+  "val_frac": 0.1,
+  "val_every": 8,
+  "val_n_inputs": 24,
+  "device": "cpu",
+  "seed": 42,
+  "exp_dir": "experiments/leetcode_001",
+  "n_params": 2145408,
+  "n_samples": 84
+}
