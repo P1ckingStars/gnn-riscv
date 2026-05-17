@@ -1,0 +1,16 @@
+# Smallest possible "experiment" — builds a tiny dataset and runs the demo pipeline
+# against it. Used as the smoke check that the infra is healthy on a fresh machine.
+#
+# Run from the repo root:
+#   python scripts/build_dataset.py --n 5 --out experiments/000_smoke/data --seed 0
+#   python scripts/demo_pipeline.py --n-specs 5 --seed 0
+
+dataset:
+  n: 5
+  seed: 0
+  max_depth: 4
+  n_params: 2
+  ret_ty: I32
+  out: experiments/000_smoke/data
+
+# No model section yet — workstream C will populate it.
