@@ -14,15 +14,19 @@ verifier.
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass, field
+from typing import Optional
 
 from spec.dsl import (
-    And, Bin, BinOp, BoolFalse, BoolTrue, Cmp, CmpOp, Const, Exists, Expr, Forall,
-    Formula, Iff, Implies, LetTerm, Not, Or, Param, Select, Spec, Ty, Un, UnOp, Var,
-    mask_to, signed,
+    And, AnyTy, Bin, BinOp, BoolFalse, BoolTrue, Cmp, CmpOp, Const, Exists, Expr,
+    Forall, Formula, Iff, Implies, LetTerm, Load, Not, Or, Param, PtrAdd, PtrTy,
+    Select, Spec, Ty, Un, UnOp, Var, XLEN, mask_to, signed,
 )
 
 
 BOUNDED_ENUM_MAX_VALUES = 256  # enumerate quantifiers only when |Ty| <= this
+
+PTR_MASK = (1 << XLEN) - 1
 
 
 class UndefinedBehavior(Exception):
@@ -33,18 +37,66 @@ class NeedsSMT(Exception):
     """Raised when the interpreter can't decide a quantifier (too wide to enumerate)."""
 
 
+@dataclass
+class Memory:
+    """Byte-addressable memory state for the interpreter. Holds a sparse byte map
+    (``addr → byte``). Out-of-bounds reads return 0 (treat unmapped memory as zeros)."""
+    bytes: dict[int, int] = field(default_factory=dict)
+
+    @classmethod
+    def from_arrays(cls, arrays: dict[int, list[int]], elem_ty: Ty) -> "Memory":
+        """Populate consecutive elements of ``elem_ty`` starting at each base address.
+        Convenience for setting up test heaps: ``Memory.from_arrays({1000: [7, 11, 13]}, Ty.I32)``
+        writes 7 to 1000..1003, 11 to 1004..1007, 13 to 1008..1011 (little-endian)."""
+        m = cls()
+        elem_bytes = elem_ty.width // 8
+        for addr, vals in arrays.items():
+            for i, v in enumerate(vals):
+                m._store_bytes(addr + i * elem_bytes, mask_to(v, elem_ty), elem_bytes)
+        return m
+
+    def store(self, addr: int, value: int, ty: Ty) -> None:
+        self._store_bytes(addr & PTR_MASK, mask_to(value, ty), ty.width // 8)
+
+    def load(self, addr: int, ty: Ty) -> int:
+        nbytes = ty.width // 8
+        v = 0
+        base = addr & PTR_MASK
+        for i in range(nbytes):
+            v |= self.bytes.get((base + i) & PTR_MASK, 0) << (i * 8)
+        return v  # unsigned canonical
+
+    def _store_bytes(self, base: int, masked: int, nbytes: int) -> None:
+        for i in range(nbytes):
+            self.bytes[(base + i) & PTR_MASK] = (masked >> (i * 8)) & 0xFF
+
+
+def _mask_any(value: int, ty: AnyTy) -> int:
+    """Mask to type — handles both scalar and pointer types."""
+    if isinstance(ty, Ty):
+        return mask_to(value, ty)
+    return value & PTR_MASK
+
+
 # ---- term evaluation (unchanged from earlier) -------------------------------
 
-def evaluate(spec: Spec, args: tuple[int, ...]) -> int:
+def evaluate(
+    spec: Spec, args: tuple[int, ...], memory: Optional[Memory] = None,
+) -> int:
     """Evaluate a **functional** spec. Raises ``ValueError`` if the spec is relational
-    (no closed-form output). Use ``satisfies`` for relational specs."""
+    (no closed-form output). Use ``satisfies`` for relational specs.
+
+    For specs that contain ``Load`` ops, pass a ``Memory`` argument; defaults to an
+    empty memory (all-zero reads) otherwise.
+    """
     if not spec.is_functional():
         raise ValueError("evaluate(): spec is not functional; use satisfies()")
     if len(args) != len(spec.inputs):
         raise ValueError(f"arity mismatch: spec expects {len(spec.inputs)}, got {len(args)}")
-    env = {p.name: mask_to(v, p.ty) for p, v in zip(spec.inputs, args)}
+    env = {p.name: _mask_any(v, p.ty) for p, v in zip(spec.inputs, args)}
+    env["_memory"] = memory if memory is not None else Memory()
     body = spec.functional_body()
-    return mask_to(_eval_expr(body, env), body.ty)
+    return _mask_any(_eval_expr(body, env), body.ty)
 
 
 def _eval_expr(e: Expr, env: dict[str, int]) -> int:
@@ -62,6 +114,19 @@ def _eval_expr(e: Expr, env: dict[str, int]) -> int:
     if isinstance(e, Select):
         c = _eval_expr(e.cond, env)
         return _eval_expr(e.then, env) if c != 0 else _eval_expr(e.else_, env)
+    if isinstance(e, PtrAdd):
+        base = _eval_expr(e.base, env)
+        off = _eval_expr(e.offset, env)
+        # Offset may be narrower than XLEN; sign-extend so negative offsets work.
+        if isinstance(e.offset.ty, Ty) and e.offset.ty.width < XLEN:
+            off = signed(off, e.offset.ty)
+        return (base + off) & PTR_MASK
+    if isinstance(e, Load):
+        addr = _eval_expr(e.ptr, env)
+        memory: Memory = env["_memory"]
+        if not isinstance(e.ty, Ty):
+            raise TypeError(f"Load result must be scalar; got {e.ty}")
+        return memory.load(addr, e.ty)
     raise TypeError(f"unknown Expr: {type(e).__name__}")
 
 
@@ -167,18 +232,23 @@ def _eval_cmp(op: CmpOp, l: int, r: int, ty: Ty) -> bool:
 
 # ---- spec-level predicates --------------------------------------------------
 
-def precondition_holds(spec: Spec, inputs: tuple[int, ...]) -> bool:
-    env = {p.name: mask_to(v, p.ty) for p, v in zip(spec.inputs, inputs)}
+def precondition_holds(
+    spec: Spec, inputs: tuple[int, ...], memory: Optional[Memory] = None,
+) -> bool:
+    env = {p.name: _mask_any(v, p.ty) for p, v in zip(spec.inputs, inputs)}
+    env["_memory"] = memory if memory is not None else Memory()
     return eval_formula(spec.pre, env)
 
 
 def satisfies(
     spec: Spec, inputs: tuple[int, ...], outputs: tuple[int, ...],
+    memory: Optional[Memory] = None,
 ) -> bool:
     """Return True iff (inputs, outputs) satisfies the spec's postcondition.
     Caller is responsible for checking ``precondition_holds`` separately."""
-    env = {p.name: mask_to(v, p.ty) for p, v in zip(spec.inputs, inputs)}
-    env.update({p.name: mask_to(v, p.ty) for p, v in zip(spec.outputs, outputs)})
+    env = {p.name: _mask_any(v, p.ty) for p, v in zip(spec.inputs, inputs)}
+    env.update({p.name: _mask_any(v, p.ty) for p, v in zip(spec.outputs, outputs)})
+    env["_memory"] = memory if memory is not None else Memory()
     return eval_formula(spec.post, env)
 
 
@@ -190,7 +260,18 @@ def _boundary_values(ty: Ty) -> list[int]:
 
 def sample_inputs(spec: Spec, n: int, seed: int = 0) -> list[tuple[int, ...]]:
     """Return n input tuples that satisfy ``spec.pre`` and don't trigger UB during
-    Pre evaluation. (UB inside Post is up to the caller; satisfies() will surface it.)"""
+    Pre evaluation. (UB inside Post is up to the caller; satisfies() will surface it.)
+
+    Raises ``NotImplementedError`` if any input is pointer-typed — pointer inputs need
+    a memory layout that this generic sampler can't synthesize. For pointer-bearing
+    specs, build inputs + memory by hand and call ``evaluate``/``satisfies`` directly.
+    """
+    for p in spec.inputs:
+        if isinstance(p.ty, PtrTy):
+            raise NotImplementedError(
+                f"sample_inputs: pointer input {p.name!r} requires a memory layout; "
+                "construct inputs explicitly and call satisfies() / evaluate(memory=...)"
+            )
     rng = random.Random(seed)
     out: list[tuple[int, ...]] = []
     seen: set[tuple[int, ...]] = set()

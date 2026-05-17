@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Union
 
 
 class Ty(Enum):
@@ -40,6 +41,50 @@ class Ty(Enum):
     @property
     def sign_bit(self) -> int:
         return 1 << (self.value - 1)
+
+
+XLEN = 64  # RV64 pointer width
+
+
+@dataclass(frozen=True)
+class PtrTy:
+    """Typed pointer — a 64-bit address tagged with its element type.
+
+    The element type can be any AnyTy (a scalar Ty or another PtrTy), so e.g.
+    ``PtrTy(PtrTy(Ty.I32))`` is ``int**``. Arithmetic on pointers is *byte*-based
+    (matches the hardware); element indexing is sugar built on top via PtrAdd with
+    multiples of ``elem_size_bytes``.
+    """
+    elem_ty: "AnyTy"
+
+    @property
+    def width(self) -> int:
+        return XLEN
+
+    @property
+    def mask(self) -> int:
+        return (1 << XLEN) - 1
+
+    @property
+    def sign_bit(self) -> int:
+        return 1 << (XLEN - 1)
+
+    @property
+    def elem_size_bytes(self) -> int:
+        """Size in bytes of the pointee — used for canonical element-indexing offsets."""
+        if isinstance(self.elem_ty, Ty):
+            return self.elem_ty.width // 8
+        if isinstance(self.elem_ty, PtrTy):
+            return XLEN // 8
+        raise TypeError(f"unhandled elem_ty: {self.elem_ty}")
+
+    def __repr__(self) -> str:
+        if isinstance(self.elem_ty, Ty):
+            return f"Ptr<{self.elem_ty.name}>"
+        return f"Ptr<{self.elem_ty}>"
+
+
+AnyTy = Union[Ty, PtrTy]
 
 
 # ---- term-layer operator enums ----------------------------------------------
@@ -118,6 +163,24 @@ class Select(Expr):
     cond: Expr
     then: Expr
     else_: Expr
+
+
+@dataclass(frozen=True)
+class PtrAdd(Expr):
+    """``base + offset_bytes``. ``base`` must have ``PtrTy``; ``offset`` is a scalar
+    integer (sign-extended to 64 bits during interpretation/SMT). Result type equals
+    ``base.ty`` (same pointee type as input).
+    """
+    base: Expr
+    offset: Expr
+
+
+@dataclass(frozen=True)
+class Load(Expr):
+    """``*ptr`` — read ``ty.width / 8`` bytes from the implicit memory state at address
+    ``ptr``, little-endian. ``ty`` must equal ``ptr.ty.elem_ty``.
+    """
+    ptr: Expr
 
 
 # ---- formula AST ------------------------------------------------------------
@@ -304,8 +367,10 @@ def type_check(spec: Spec) -> None:
     _tc_formula(spec.post, env)
 
 
-def _tc_expr(e: Expr, env: dict[str, Ty]) -> None:
+def _tc_expr(e: Expr, env: dict[str, AnyTy]) -> None:
     if isinstance(e, Const):
+        if not isinstance(e.ty, Ty):
+            raise TypeError(f"Const must be scalar, got {e.ty}")
         if not (0 <= e.value <= e.ty.mask):
             raise TypeError(f"Const value {e.value} out of range for {e.ty}")
         return
@@ -318,6 +383,9 @@ def _tc_expr(e: Expr, env: dict[str, Ty]) -> None:
     if isinstance(e, Bin):
         _tc_expr(e.lhs, env)
         _tc_expr(e.rhs, env)
+        # Scalar-only — pointer arithmetic goes through PtrAdd.
+        if not (isinstance(e.lhs.ty, Ty) and isinstance(e.rhs.ty, Ty)):
+            raise TypeError(f"{e.op.name}: pointer operands; use PtrAdd for ptr arithmetic")
         if e.op in _PRESERVING_BIN_OPS:
             if e.lhs.ty != e.rhs.ty:
                 raise TypeError(f"{e.op.name}: operand tys {e.lhs.ty} vs {e.rhs.ty}")
@@ -326,13 +394,19 @@ def _tc_expr(e: Expr, env: dict[str, Ty]) -> None:
         return
     if isinstance(e, Un):
         _tc_expr(e.arg, env)
+        if not isinstance(e.arg.ty, Ty):
+            raise TypeError(f"{e.op.name}: pointer arg not allowed")
         if e.op in (UnOp.NEG, UnOp.NOT):
             if e.ty != e.arg.ty:
                 raise TypeError(f"{e.op.name}: result ty {e.ty} != arg ty {e.arg.ty}")
         elif e.op in (UnOp.SEXT, UnOp.ZEXT):
+            if not isinstance(e.ty, Ty):
+                raise TypeError(f"{e.op.name}: result must be scalar, got {e.ty}")
             if e.ty.width <= e.arg.ty.width:
                 raise TypeError(f"{e.op.name}: result width {e.ty.width} must exceed arg {e.arg.ty.width}")
         elif e.op is UnOp.TRUNC:
+            if not isinstance(e.ty, Ty):
+                raise TypeError(f"trunc: result must be scalar, got {e.ty}")
             if e.ty.width >= e.arg.ty.width:
                 raise TypeError(f"trunc: result width {e.ty.width} must be less than arg {e.arg.ty.width}")
         return
@@ -342,6 +416,27 @@ def _tc_expr(e: Expr, env: dict[str, Ty]) -> None:
         _tc_expr(e.else_, env)
         if e.then.ty != e.else_.ty or e.ty != e.then.ty:
             raise TypeError(f"select: result {e.ty}, then {e.then.ty}, else {e.else_.ty}")
+        return
+    if isinstance(e, PtrAdd):
+        _tc_expr(e.base, env)
+        _tc_expr(e.offset, env)
+        if not isinstance(e.base.ty, PtrTy):
+            raise TypeError(f"PtrAdd: base must be Ptr, got {e.base.ty}")
+        if not isinstance(e.offset.ty, Ty):
+            raise TypeError(f"PtrAdd: offset must be scalar int, got {e.offset.ty}")
+        if e.ty != e.base.ty:
+            raise TypeError(
+                f"PtrAdd: result ty {e.ty} must equal base ty {e.base.ty}"
+            )
+        return
+    if isinstance(e, Load):
+        _tc_expr(e.ptr, env)
+        if not isinstance(e.ptr.ty, PtrTy):
+            raise TypeError(f"Load: ptr must be Ptr, got {e.ptr.ty}")
+        if e.ty != e.ptr.ty.elem_ty:
+            raise TypeError(
+                f"Load: result ty {e.ty} != ptr elem ty {e.ptr.ty.elem_ty}"
+            )
         return
     raise TypeError(f"unknown Expr node: {type(e).__name__}")
 
@@ -354,6 +449,10 @@ def _tc_formula(f: Formula, env: dict[str, Ty]) -> None:
         _tc_expr(f.rhs, env)
         if f.lhs.ty != f.rhs.ty:
             raise TypeError(f"Cmp {f.op.name}: operand tys {f.lhs.ty} vs {f.rhs.ty}")
+        if isinstance(f.lhs.ty, PtrTy) and f.op not in (CmpOp.EQ, CmpOp.NE):
+            raise TypeError(
+                f"Cmp {f.op.name}: only EQ/NE are defined on pointers"
+            )
         return
     if isinstance(f, Not):
         _tc_formula(f.arg, env)

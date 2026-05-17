@@ -1,19 +1,23 @@
 """JSON-round-trippable serialization for the FOL spec DSL.
 
-Schema v2 (current): Hoare-triple specs with separate term + formula layers.
-Schema v1 (deprecated): pre-FOL functional specs — not supported; regenerate datasets.
+Schema v3 (current): adds typed ``PtrTy`` for parameters/results and the ``PtrAdd`` /
+  ``Load`` expression nodes. Types are emitted as ``{"k": "int", "n": "I32"}`` or
+  ``{"k": "ptr", "elem": {...}}`` so future type kinds slot in cleanly.
+Schema v2 (deprecated): types were emitted as bare strings — not loadable; regenerate.
+Schema v1 (deprecated): pre-FOL functional specs — not loadable; regenerate.
 """
 from __future__ import annotations
 
 import json
 
 from spec.dsl import (
-    And, Bin, BinOp, BoolFalse, BoolTrue, Cmp, CmpOp, Const, Exists, Expr, Forall,
-    Formula, Iff, Implies, LetTerm, Not, Or, Param, Select, Spec, Ty, Un, UnOp, Var,
+    And, AnyTy, Bin, BinOp, BoolFalse, BoolTrue, Cmp, CmpOp, Const, Exists, Expr,
+    Forall, Formula, Iff, Implies, LetTerm, Load, Not, Or, Param, PtrAdd, PtrTy,
+    Select, Spec, Ty, Un, UnOp, Var,
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def to_dict(spec: Spec) -> dict:
@@ -47,36 +51,58 @@ def from_json(text: str) -> Spec:
     return from_dict(json.loads(text))
 
 
+def _ty_to_dict(t: AnyTy) -> dict:
+    if isinstance(t, Ty):
+        return {"k": "int", "n": t.name}
+    if isinstance(t, PtrTy):
+        return {"k": "ptr", "elem": _ty_to_dict(t.elem_ty)}
+    raise TypeError(f"unhandled type: {t!r}")
+
+
+def _ty_from_dict(d: dict) -> AnyTy:
+    k = d["k"]
+    if k == "int":
+        return Ty[d["n"]]
+    if k == "ptr":
+        return PtrTy(elem_ty=_ty_from_dict(d["elem"]))
+    raise ValueError(f"unknown type kind: {k}")
+
+
 def _param_to_dict(p: Param) -> dict:
-    return {"name": p.name, "ty": p.ty.name}
+    return {"name": p.name, "ty": _ty_to_dict(p.ty)}
 
 
 def _param_from_dict(d: dict) -> Param:
-    return Param(name=d["name"], ty=Ty[d["ty"]])
+    return Param(name=d["name"], ty=_ty_from_dict(d["ty"]))
 
 
 def _expr_to_dict(e: Expr) -> dict:
     if isinstance(e, Const):
-        return {"node": "const", "ty": e.ty.name, "value": e.value}
+        return {"node": "const", "ty": _ty_to_dict(e.ty), "value": e.value}
     if isinstance(e, Var):
-        return {"node": "var", "ty": e.ty.name, "name": e.name}
+        return {"node": "var", "ty": _ty_to_dict(e.ty), "name": e.name}
     if isinstance(e, Bin):
-        return {"node": "bin", "ty": e.ty.name, "op": e.op.name,
+        return {"node": "bin", "ty": _ty_to_dict(e.ty), "op": e.op.name,
                 "lhs": _expr_to_dict(e.lhs), "rhs": _expr_to_dict(e.rhs)}
     if isinstance(e, Un):
-        return {"node": "un", "ty": e.ty.name, "op": e.op.name,
+        return {"node": "un", "ty": _ty_to_dict(e.ty), "op": e.op.name,
                 "arg": _expr_to_dict(e.arg)}
     if isinstance(e, Select):
-        return {"node": "select", "ty": e.ty.name,
+        return {"node": "select", "ty": _ty_to_dict(e.ty),
                 "cond": _expr_to_dict(e.cond),
                 "then": _expr_to_dict(e.then),
                 "else": _expr_to_dict(e.else_)}
+    if isinstance(e, PtrAdd):
+        return {"node": "ptradd", "ty": _ty_to_dict(e.ty),
+                "base": _expr_to_dict(e.base), "offset": _expr_to_dict(e.offset)}
+    if isinstance(e, Load):
+        return {"node": "load", "ty": _ty_to_dict(e.ty), "ptr": _expr_to_dict(e.ptr)}
     raise TypeError(f"unhandled Expr: {type(e).__name__}")
 
 
 def _expr_from_dict(d: dict) -> Expr:
     n = d["node"]
-    ty = Ty[d["ty"]]
+    ty = _ty_from_dict(d["ty"])
     if n == "const":
         return Const(ty=ty, value=d["value"])
     if n == "var":
@@ -91,6 +117,11 @@ def _expr_from_dict(d: dict) -> Expr:
                       cond=_expr_from_dict(d["cond"]),
                       then=_expr_from_dict(d["then"]),
                       else_=_expr_from_dict(d["else"]))
+    if n == "ptradd":
+        return PtrAdd(ty=ty, base=_expr_from_dict(d["base"]),
+                      offset=_expr_from_dict(d["offset"]))
+    if n == "load":
+        return Load(ty=ty, ptr=_expr_from_dict(d["ptr"]))
     raise ValueError(f"unknown expr node: {n}")
 
 
@@ -120,7 +151,7 @@ def _formula_to_dict(f: Formula) -> dict:
         return {"f": "exists", "var": _param_to_dict(f.var),
                 "body": _formula_to_dict(f.body)}
     if isinstance(f, LetTerm):
-        return {"f": "let", "name": f.name, "ty": f.ty.name,
+        return {"f": "let", "name": f.name, "ty": _ty_to_dict(f.ty),
                 "value": _expr_to_dict(f.value), "body": _formula_to_dict(f.body)}
     raise TypeError(f"unhandled Formula: {type(f).__name__}")
 
@@ -150,7 +181,7 @@ def _formula_from_dict(d: dict) -> Formula:
         return Exists(var=_param_from_dict(d["var"]),
                       body=_formula_from_dict(d["body"]))
     if k == "let":
-        return LetTerm(name=d["name"], ty=Ty[d["ty"]],
+        return LetTerm(name=d["name"], ty=_ty_from_dict(d["ty"]),
                        value=_expr_from_dict(d["value"]),
                        body=_formula_from_dict(d["body"]))
     raise ValueError(f"unknown formula node: {k}")

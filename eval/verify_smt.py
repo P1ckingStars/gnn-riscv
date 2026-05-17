@@ -16,8 +16,9 @@ from dataclasses import dataclass
 import z3
 
 from spec.dsl import (
-    And, Bin, BinOp, BoolFalse, BoolTrue, Cmp, CmpOp, Const, Exists, Expr, Forall,
-    Formula, Iff, Implies, LetTerm, Not, Or, Select, Spec, Ty, Un, UnOp, Var,
+    And, AnyTy, Bin, BinOp, BoolFalse, BoolTrue, Cmp, CmpOp, Const, Exists, Expr,
+    Forall, Formula, Iff, Implies, LetTerm, Load, Not, Or, PtrAdd, PtrTy, Select,
+    Spec, Ty, Un, UnOp, Var, XLEN,
 )
 from eval._asm_parse import Insn, parse_function, parse_imm, reg_index
 
@@ -36,16 +37,27 @@ class SMTVerdict:
 
 # ---- term/formula translation to Z3 ----------------------------------------
 
+def _z3_load(mem: z3.ArrayRef, addr: z3.BitVecRef, ty: Ty) -> z3.BitVecRef:
+    """Read ``ty.width / 8`` bytes from ``mem`` starting at ``addr``, little-endian
+    (low byte at ``addr``, high byte at ``addr + n - 1``). Returns a BitVec of
+    width ``ty.width``."""
+    nbytes = ty.width // 8
+    parts = [z3.Select(mem, addr + i) for i in range(nbytes)]
+    # Concat is MSB-to-LSB, so reverse the LE byte list.
+    return z3.Concat(list(reversed(parts)))
+
+
 def _term_to_z3(
-    e: Expr, env: dict[str, z3.BitVecRef], ub: list[z3.BoolRef]
+    e: Expr, env: dict[str, z3.BitVecRef], ub: list[z3.BoolRef],
+    mem: z3.ArrayRef | None = None,
 ) -> z3.BitVecRef:
     if isinstance(e, Const):
         return z3.BitVecVal(e.value, e.ty.width)
     if isinstance(e, Var):
         return env[e.name]
     if isinstance(e, Bin):
-        l = _term_to_z3(e.lhs, env, ub)
-        r = _term_to_z3(e.rhs, env, ub)
+        l = _term_to_z3(e.lhs, env, ub, mem)
+        r = _term_to_z3(e.rhs, env, ub, mem)
         op = e.op
         w = e.ty.width
         if op is BinOp.ADD: return l + r
@@ -68,7 +80,7 @@ def _term_to_z3(
             if op is BinOp.LSHR: return z3.LShR(l, r)
             return l >> r
     if isinstance(e, Un):
-        a = _term_to_z3(e.arg, env, ub)
+        a = _term_to_z3(e.arg, env, ub, mem)
         op = e.op
         if op is UnOp.NEG: return -a
         if op is UnOp.NOT: return ~a
@@ -76,21 +88,38 @@ def _term_to_z3(
         if op is UnOp.ZEXT: return z3.ZeroExt(e.ty.width - e.arg.ty.width, a)
         if op is UnOp.TRUNC: return z3.Extract(e.ty.width - 1, 0, a)
     if isinstance(e, Select):
-        c = _term_to_z3(e.cond, env, ub)
-        t = _term_to_z3(e.then, env, ub)
-        f = _term_to_z3(e.else_, env, ub)
+        c = _term_to_z3(e.cond, env, ub, mem)
+        t = _term_to_z3(e.then, env, ub, mem)
+        f = _term_to_z3(e.else_, env, ub, mem)
         return z3.If(c != 0, t, f)
+    if isinstance(e, PtrAdd):
+        base = _term_to_z3(e.base, env, ub, mem)  # bv64
+        off = _term_to_z3(e.offset, env, ub, mem)
+        if off.size() < XLEN:
+            # Sign-extend so negative offsets behave like in C.
+            off = z3.SignExt(XLEN - off.size(), off)
+        elif off.size() > XLEN:
+            off = z3.Extract(XLEN - 1, 0, off)
+        return base + off
+    if isinstance(e, Load):
+        if mem is None:
+            raise ValueError("Load encountered but no memory Z3 array was provided")
+        addr = _term_to_z3(e.ptr, env, ub, mem)
+        if not isinstance(e.ty, Ty):
+            raise TypeError(f"Load result must be scalar; got {e.ty}")
+        return _z3_load(mem, addr, e.ty)
     raise TypeError(f"unhandled term: {type(e).__name__}")
 
 
 def _formula_to_z3(
-    f: Formula, env: dict[str, z3.BitVecRef], ub: list[z3.BoolRef]
+    f: Formula, env: dict[str, z3.BitVecRef], ub: list[z3.BoolRef],
+    mem: z3.ArrayRef | None = None,
 ) -> z3.BoolRef:
     if isinstance(f, BoolTrue):  return z3.BoolVal(True)
     if isinstance(f, BoolFalse): return z3.BoolVal(False)
     if isinstance(f, Cmp):
-        l = _term_to_z3(f.lhs, env, ub)
-        r = _term_to_z3(f.rhs, env, ub)
+        l = _term_to_z3(f.lhs, env, ub, mem)
+        r = _term_to_z3(f.rhs, env, ub, mem)
         op = f.op
         if op is CmpOp.EQ:  return l == r
         if op is CmpOp.NE:  return l != r
@@ -103,22 +132,20 @@ def _formula_to_z3(
         if op is CmpOp.UGT: return z3.UGT(l, r)
         if op is CmpOp.UGE: return z3.UGE(l, r)
     if isinstance(f, Not):
-        return z3.Not(_formula_to_z3(f.arg, env, ub))
+        return z3.Not(_formula_to_z3(f.arg, env, ub, mem))
     if isinstance(f, And):
-        return z3.And(_formula_to_z3(f.lhs, env, ub), _formula_to_z3(f.rhs, env, ub))
+        return z3.And(_formula_to_z3(f.lhs, env, ub, mem), _formula_to_z3(f.rhs, env, ub, mem))
     if isinstance(f, Or):
-        return z3.Or(_formula_to_z3(f.lhs, env, ub), _formula_to_z3(f.rhs, env, ub))
+        return z3.Or(_formula_to_z3(f.lhs, env, ub, mem), _formula_to_z3(f.rhs, env, ub, mem))
     if isinstance(f, Implies):
-        return z3.Implies(_formula_to_z3(f.ant, env, ub),
-                          _formula_to_z3(f.cons, env, ub))
+        return z3.Implies(_formula_to_z3(f.ant, env, ub, mem),
+                          _formula_to_z3(f.cons, env, ub, mem))
     if isinstance(f, Iff):
-        return _formula_to_z3(f.lhs, env, ub) == _formula_to_z3(f.rhs, env, ub)
+        return _formula_to_z3(f.lhs, env, ub, mem) == _formula_to_z3(f.rhs, env, ub, mem)
     if isinstance(f, (Forall, Exists)):
         bound = z3.BitVec(f"_b_{f.var.name}", f.var.ty.width)
         inner_ub: list[z3.BoolRef] = []
-        body = _formula_to_z3(f.body, {**env, f.var.name: bound}, inner_ub)
-        # Within a quantifier, UB conditions are guarded by the bound variable;
-        # treat the quantifier as "for all (resp. exists) bound such that no UB ∧ body".
+        body = _formula_to_z3(f.body, {**env, f.var.name: bound}, inner_ub, mem)
         if inner_ub:
             ub_pred = z3.And(*inner_ub)
             body = z3.Implies(ub_pred, body) if isinstance(f, Forall) else z3.And(ub_pred, body)
@@ -126,9 +153,8 @@ def _formula_to_z3(
             return z3.ForAll([bound], body)
         return z3.Exists([bound], body)
     if isinstance(f, LetTerm):
-        v = _term_to_z3(f.value, env, ub)
-        # Bind the let-name to the value; pure substitution.
-        return _formula_to_z3(f.body, {**env, f.name: v}, ub)
+        v = _term_to_z3(f.value, env, ub, mem)
+        return _formula_to_z3(f.body, {**env, f.name: v}, ub, mem)
     raise TypeError(f"unhandled formula: {type(f).__name__}")
 
 
@@ -281,15 +307,44 @@ _I_SHIFT_32: dict[str, callable] = {  # type: ignore[type-arg]
 # ---- entry point ------------------------------------------------------------
 
 def _input_z3_vars(spec: Spec) -> tuple[list[z3.BitVecRef], dict[str, z3.BitVecRef]]:
-    """Allocate a typed BitVec per spec input, plus the sign-extended-to-64 form that
-    goes into a<i> per the lp64 calling convention."""
+    """Allocate a typed BitVec per spec input. For scalar params the BitVec is
+    ``p.ty.width`` bits and a sign-extended 64-bit version is what would go into ``a<i>``
+    under the lp64 ABI. For pointer params the value is a 64-bit address that lands in
+    ``a<i>`` directly."""
     typed: dict[str, z3.BitVecRef] = {}
     arg_regs: list[z3.BitVecRef] = []
     for p in spec.inputs:
-        bv = z3.BitVec(p.name, p.ty.width)
-        typed[p.name] = bv
-        arg_regs.append(bv if p.ty.width == 64 else z3.SignExt(64 - p.ty.width, bv))
+        if isinstance(p.ty, PtrTy):
+            bv = z3.BitVec(p.name, XLEN)
+            typed[p.name] = bv
+            arg_regs.append(bv)
+        else:
+            bv = z3.BitVec(p.name, p.ty.width)
+            typed[p.name] = bv
+            arg_regs.append(bv if p.ty.width == 64 else z3.SignExt(64 - p.ty.width, bv))
     return arg_regs, typed
+
+
+def _make_memory() -> z3.ArrayRef:
+    """Allocate a fresh symbolic memory array (addr: bv64 → byte: bv8)."""
+    return z3.Array("mem", z3.BitVecSort(XLEN), z3.BitVecSort(8))
+
+
+def _spec_uses_memory(spec: Spec) -> bool:
+    """Return True if any Load appears in pre or post — saves a Z3 array allocation when
+    the spec doesn't actually touch memory."""
+    return _has_load(spec.pre) or _has_load(spec.post)
+
+
+def _has_load(node) -> bool:
+    if isinstance(node, Load):
+        return True
+    if hasattr(node, "__dataclass_fields__"):
+        for fname in node.__dataclass_fields__:
+            v = getattr(node, fname)
+            if isinstance(v, (Expr, Formula)) and _has_load(v):
+                return True
+    return False
 
 
 def verify_smt(
@@ -298,24 +353,30 @@ def verify_smt(
     timeout_s: float = 30.0,
     fn_name: str = "spec_fn",
 ) -> SMTVerdict:
+    """Spec-vs-asm equivalence. The asm-side symbolic executor (v1 MVP) doesn't model
+    memory loads/stores yet — if the candidate asm contains lw/sw, parse_function will
+    surface them via ``UnsupportedAsm`` in ``_exec_asm``. Pure-arithmetic asm + a
+    Load-free spec works fully."""
     insns = parse_function(candidate_asm, fn_name)
     arg_regs, typed_inputs = _input_z3_vars(spec)
     a0_after = _exec_asm(insns, arg_regs)
 
-    # Bind the single output var to the appropriate slice of a0.
     out = spec.ret_param
-    if out.ty.width == 64:
+    if isinstance(out.ty, PtrTy):
+        out_bv = a0_after  # already bv64
+    elif out.ty.width == 64:
         out_bv = a0_after
     else:
         out_bv = z3.Extract(out.ty.width - 1, 0, a0_after)
     env: dict[str, z3.BitVecRef] = {**typed_inputs, out.name: out_bv}
 
+    mem = _make_memory() if _spec_uses_memory(spec) else None
+
     ub_pre: list[z3.BoolRef] = []
     ub_post: list[z3.BoolRef] = []
-    pre_z3 = _formula_to_z3(spec.pre, env, ub_pre)
-    post_z3 = _formula_to_z3(spec.post, env, ub_post)
+    pre_z3 = _formula_to_z3(spec.pre, env, ub_pre, mem)
+    post_z3 = _formula_to_z3(spec.post, env, ub_post, mem)
 
-    # "Valid input" = pre holds AND no UB during pre/post evaluation.
     valid = z3.And(pre_z3, *ub_pre, *ub_post) if (ub_pre or ub_post) else pre_z3
 
     solver = z3.Solver()
@@ -332,5 +393,62 @@ def verify_smt(
     if result == z3.sat:
         m = solver.model()
         cex = tuple(m.eval(typed_inputs[p.name]).as_long() for p in spec.inputs)
+        return SMTVerdict(False, cex, elapsed, False)
+    return SMTVerdict(False, None, elapsed, True)
+
+
+def prove_functional_equiv(
+    spec_a: Spec, spec_b: Spec, timeout_s: float = 10.0,
+) -> SMTVerdict:
+    """Prove two functional specs always compute the same value given matching inputs
+    + a shared memory state. Useful for spec-vs-spec equivalence checks (e.g. testing
+    that a rewrite is sound) without going through asm.
+
+    Both specs must be functional and share the same input + output signature. Returns
+    UNSAT (equivalent=True) iff the post-conditions agree under any inputs satisfying
+    both pre-conditions and no-UB."""
+    if not (spec_a.is_functional() and spec_b.is_functional()):
+        raise ValueError("prove_functional_equiv: both specs must be functional")
+    if [p.ty for p in spec_a.inputs] != [p.ty for p in spec_b.inputs]:
+        raise ValueError("input type signatures differ")
+    if spec_a.ret_ty != spec_b.ret_ty:
+        raise ValueError("return types differ")
+
+    # Allocate Z3 vars from spec_a's input signature (matched by spec_b).
+    typed: dict[str, z3.BitVecRef] = {}
+    for p in spec_a.inputs:
+        if isinstance(p.ty, PtrTy):
+            typed[p.name] = z3.BitVec(p.name, XLEN)
+        else:
+            typed[p.name] = z3.BitVec(p.name, p.ty.width)
+    # spec_b may use different param names; build a parallel mapping by position.
+    env_b = dict(typed)
+    for pa, pb in zip(spec_a.inputs, spec_b.inputs):
+        env_b[pb.name] = typed[pa.name]
+
+    mem = _make_memory() if (_spec_uses_memory(spec_a) or _spec_uses_memory(spec_b)) else None
+
+    ub: list[z3.BoolRef] = []
+    body_a = _term_to_z3(spec_a.functional_body(), typed, ub, mem)
+    body_b = _term_to_z3(spec_b.functional_body(), env_b, ub, mem)
+
+    pre_ub: list[z3.BoolRef] = []
+    pre_a = _formula_to_z3(spec_a.pre, typed, pre_ub, mem)
+    pre_b = _formula_to_z3(spec_b.pre, env_b, pre_ub, mem)
+
+    solver = z3.Solver()
+    solver.set("timeout", int(timeout_s * 1000))
+    solver.add(z3.And(pre_a, pre_b, *pre_ub, *ub))
+    solver.add(body_a != body_b)
+
+    t0 = time.time()
+    result = solver.check()
+    elapsed = time.time() - t0
+
+    if result == z3.unsat:
+        return SMTVerdict(True, None, elapsed, False)
+    if result == z3.sat:
+        m = solver.model()
+        cex = tuple(m.eval(typed[p.name]).as_long() for p in spec_a.inputs)
         return SMTVerdict(False, cex, elapsed, False)
     return SMTVerdict(False, None, elapsed, True)
