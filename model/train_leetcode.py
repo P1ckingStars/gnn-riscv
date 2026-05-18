@@ -188,6 +188,9 @@ def main() -> None:
                     help="'auto' uses cuda if available")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--exp-dir", type=Path, default=Path("experiments/leetcode_001"))
+    ap.add_argument("--init-ckpt", type=Path, default=None,
+                    help="warm-start encoder+decoder weights from a checkpoint "
+                         "(arch must match)")
     args = ap.parse_args()
 
     if args.device == "auto":
@@ -241,6 +244,13 @@ def main() -> None:
     n_params = sum(p.numel() for p in encoder.parameters()) + \
                sum(p.numel() for p in decoder.parameters())
     print(f"model params: {n_params / 1e6:.2f}M")
+
+    if args.init_ckpt is not None:
+        blob = torch.load(args.init_ckpt, map_location=device, weights_only=False)
+        enc_state = blob["encoder"]; dec_state = blob["decoder"]
+        encoder.load_state_dict(enc_state)
+        decoder.load_state_dict(dec_state)
+        print(f"warm-start from {args.init_ckpt}  (pretrain epoch {blob.get('epoch','?')})")
     opt = AdamW(
         list(encoder.parameters()) + list(decoder.parameters()), lr=args.lr,
     )
